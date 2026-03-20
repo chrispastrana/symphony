@@ -38,6 +38,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("stop_issue", %{"issue_id" => issue_id}, socket) do
+    socket =
+      case SymphonyElixir.Orchestrator.stop_issue(orchestrator(), issue_id) do
+        {:ok, _payload} ->
+          socket
+          |> put_flash(:info, "Stopped issue #{issue_id}")
+          |> assign(:payload, load_payload())
+
+        {:error, :issue_not_found} ->
+          put_flash(socket, :error, "Issue is no longer running")
+
+        {:error, _reason} ->
+          put_flash(socket, :error, "Unable to stop issue right now")
+      end
+
+    {:noreply, socket}
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -52,6 +71,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </h1>
             <p class="hero-copy">
               Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+            </p>
+            <p :if={@payload[:codex]} class="hero-meta">
+              <span class="mono"><%= @payload.codex.model %></span>
+              <span>·</span>
+              <span><%= String.capitalize(to_string(@payload.codex.reasoning_effort)) %> reasoning</span>
             </p>
           </div>
 
@@ -100,6 +124,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Estimated cost</p>
+            <p class="metric-value numeric"><%= estimated_cost(@payload.codex_totals) %></p>
+            <p class="metric-detail">
+              Approximation from uncached token pricing.
+            </p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Runtime</p>
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
@@ -131,21 +163,23 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div class="table-wrap">
               <table class="data-table data-table-running">
                 <colgroup>
-                  <col style="width: 12rem;" />
+                  <col style="width: 13rem;" />
+                  <col style="width: 9rem;" />
                   <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
                   <col style="width: 8.5rem;" />
                   <col />
+                  <col style="width: 15rem;" />
                   <col style="width: 10rem;" />
                 </colgroup>
                 <thead>
                   <tr>
                     <th>Issue</th>
                     <th>State</th>
-                    <th>Session</th>
+                    <th>Phase</th>
                     <th>Runtime / turns</th>
                     <th>Codex update</th>
-                    <th>Tokens</th>
+                    <th>Changes</th>
+                    <th>Cost</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -153,7 +187,29 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <div class="issue-link-row">
+                          <a class="issue-link" href={"/issues/#{entry.issue_identifier}"}>Open details</a>
+                          <button
+                            type="button"
+                            class="subtle-button subtle-button-danger"
+                            phx-click="stop_issue"
+                            phx-value-issue_id={entry.issue_id}
+                            data-confirm={"Stop #{entry.issue_identifier}?"}
+                          >
+                            Stop
+                          </button>
+                          <%= if entry.session_id do %>
+                            <button
+                              type="button"
+                              class="subtle-button"
+                              data-label="Copy ID"
+                              data-copy={entry.session_id}
+                              onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                            >
+                              Copy ID
+                            </button>
+                          <% end %>
+                        </div>
                       </div>
                     </td>
                     <td>
@@ -162,20 +218,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </span>
                     </td>
                     <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
+                      <div class="detail-stack">
+                        <span class={phase_badge_class(entry.phase)}><%= entry.phase.label %></span>
+                        <span class="muted"><%= entry.phase.detail %></span>
                       </div>
                     </td>
                     <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
@@ -194,9 +239,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td>
+                      <div class="detail-stack">
+                        <span><%= changes_summary(entry.workspace_summary) %></span>
+                        <span class="muted"><%= git_summary(entry.workspace_summary) %></span>
+                      </div>
+                    </td>
+                    <td>
                       <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                        <span><%= entry.estimated_cost.formatted %></span>
+                        <span class="muted">Total: <%= format_int(entry.tokens.total_tokens) %> tokens</span>
                       </div>
                     </td>
                   </tr>
@@ -232,7 +283,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={"/issues/#{entry.issue_identifier}"}>Open details</a>
                       </div>
                     </td>
                     <td><%= entry.attempt %></td>
@@ -319,6 +370,44 @@ defmodule SymphonyElixirWeb.DashboardLive do
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base
     end
+  end
+
+  defp phase_badge_class(%{tone: tone}) do
+    base = "state-badge"
+
+    case tone do
+      "active" -> "#{base} state-badge-active"
+      "warning" -> "#{base} state-badge-warning"
+      "danger" -> "#{base} state-badge-danger"
+      _ -> base
+    end
+  end
+
+  defp phase_badge_class(_phase), do: "state-badge"
+
+  defp estimated_cost(%{estimated_cost: %{formatted: formatted}}), do: formatted
+  defp estimated_cost(_value), do: "n/a"
+
+  defp changes_summary(%{changed_file_count: 0, ahead_count: ahead_count}) when is_integer(ahead_count) and ahead_count > 0,
+    do: "#{ahead_count} commit(s) ahead"
+
+  defp changes_summary(%{changed_file_count: 0}), do: "No workspace changes yet"
+
+  defp changes_summary(%{files: [first | _], changed_file_count: count, diff_stat: diff_stat}) do
+    suffix = if count > 1, do: " +#{count - 1} more", else: ""
+    "#{first.path}#{suffix} · #{diff_summary(diff_stat)}"
+  end
+
+  defp changes_summary(_summary), do: "n/a"
+
+  defp git_summary(%{branch: branch, head_sha: sha}) when is_binary(branch) and is_binary(sha),
+    do: "#{branch}@#{sha}"
+
+  defp git_summary(%{note: note}) when is_binary(note), do: note
+  defp git_summary(_summary), do: "Git summary unavailable"
+
+  defp diff_summary(%{insertions: insertions, deletions: deletions}) do
+    "+#{insertions} / -#{deletions}"
   end
 
   defp schedule_runtime_tick do

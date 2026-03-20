@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, CodexBudget, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      stopped: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -190,14 +191,39 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        settings = Config.settings!()
+        codex_info = CodexBudget.codex_info(settings)
 
         state =
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
 
-        notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+
+        case CodexBudget.budget_exceeded?(token_payload(updated_running_entry), codex_info, settings) do
+          nil ->
+            notify_dashboard()
+            {:noreply, state}
+
+          exceeded ->
+            identifier = Map.get(updated_running_entry, :identifier, issue_id)
+            Logger.warning("Budget exceeded for issue_id=#{issue_id} issue_identifier=#{identifier}: #{exceeded.message}; stopping active agent")
+
+            state =
+              state
+              |> terminate_running_issue(issue_id, false)
+              |> cancel_retry(issue_id)
+              |> put_stopped_issue(issue_id, %{
+                state: updated_running_entry.issue.state,
+                identifier: identifier,
+                reason: exceeded.message,
+                stopped_at: DateTime.utc_now()
+              })
+
+            notify_dashboard()
+            {:noreply, state}
+        end
     end
   end
 
@@ -222,6 +248,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    state = clear_stopped_issues_for_changed_states(state)
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
@@ -553,12 +580,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed} = state,
+         %State{running: running, claimed: claimed, stopped: stopped} = state,
          active_states,
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !manually_stopped_issue?(issue, stopped) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -766,7 +794,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        stopped: Map.delete(state.stopped, issue_id)
     }
   end
 
@@ -923,6 +952,50 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+  end
+
+  defp manually_stopped_issue?(%Issue{id: issue_id, state: state_name}, stopped)
+       when is_binary(issue_id) and is_binary(state_name) and is_map(stopped) do
+    case Map.get(stopped, issue_id) do
+      %{state: stopped_state} -> normalize_issue_state(stopped_state) == normalize_issue_state(state_name)
+      _ -> false
+    end
+  end
+
+  defp manually_stopped_issue?(_issue, _stopped), do: false
+
+  defp clear_stopped_issues_for_changed_states(%State{stopped: stopped} = state) when map_size(stopped) == 0,
+    do: state
+
+  defp clear_stopped_issues_for_changed_states(%State{} = state) do
+    issue_ids = Map.keys(state.stopped)
+
+    case Tracker.fetch_issue_states_by_ids(issue_ids) do
+      {:ok, issues} ->
+        refreshed =
+          Enum.reduce(issues, state.stopped, fn
+            %Issue{id: issue_id, state: state_name}, stopped_acc when is_binary(issue_id) and is_binary(state_name) ->
+              case Map.get(stopped_acc, issue_id) do
+                %{state: stopped_state} ->
+                  if normalize_issue_state(stopped_state) == normalize_issue_state(state_name) do
+                    stopped_acc
+                  else
+                    Map.delete(stopped_acc, issue_id)
+                  end
+
+                _ ->
+                  stopped_acc
+              end
+
+            _issue, stopped_acc ->
+              stopped_acc
+          end)
+
+        %{state | stopped: refreshed}
+
+      {:error, _reason} ->
+        state
+    end
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -1097,6 +1170,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec stop_issue(String.t()) :: {:ok, map()} | {:error, term()}
+  def stop_issue(issue_id) do
+    stop_issue(__MODULE__, issue_id)
+  end
+
+  @spec stop_issue(GenServer.server(), String.t()) :: {:ok, map()} | {:error, term()}
+  def stop_issue(server, issue_id) when is_binary(issue_id) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:stop_issue, issue_id})
+    else
+      {:error, :unavailable}
+    end
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -1167,6 +1254,53 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:stop_issue, issue_id}, _from, state) when is_binary(issue_id) do
+    state = refresh_runtime_config(state)
+
+    cond do
+      Map.has_key?(state.running, issue_id) ->
+        running_entry = Map.fetch!(state.running, issue_id)
+
+        stopped_entry = %{
+          state: running_entry.issue.state,
+          identifier: running_entry.identifier,
+          stopped_at: DateTime.utc_now()
+        }
+
+        state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> cancel_retry(issue_id)
+          |> put_stopped_issue(issue_id, stopped_entry)
+
+        notify_dashboard()
+        {:reply, {:ok, %{status: "stopped", issue_id: issue_id, identifier: running_entry.identifier}}, state}
+
+      Map.has_key?(state.retry_attempts, issue_id) ->
+        retry_entry = Map.fetch!(state.retry_attempts, issue_id)
+        issue_state = fetch_issue_state_name(issue_id)
+
+        state =
+          state
+          |> cancel_retry(issue_id)
+          |> release_issue_claim(issue_id)
+          |> put_stopped_issue(issue_id, %{
+            state: issue_state || "unknown",
+            identifier: Map.get(retry_entry, :identifier),
+            stopped_at: DateTime.utc_now()
+          })
+
+        notify_dashboard()
+        {:reply, {:ok, %{status: "stopped", issue_id: issue_id, identifier: Map.get(retry_entry, :identifier)}}, state}
+
+      Map.has_key?(state.stopped, issue_id) ->
+        {:reply, {:ok, %{status: "already_stopped", issue_id: issue_id}}, state}
+
+      true ->
+        {:reply, {:error, :issue_not_found}, state}
+    end
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -1272,6 +1406,36 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pop_running_entry(state, issue_id) do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
+  end
+
+  defp token_payload(entry) do
+    %{
+      input_tokens: Map.get(entry, :codex_input_tokens, 0),
+      output_tokens: Map.get(entry, :codex_output_tokens, 0),
+      total_tokens: Map.get(entry, :codex_total_tokens, 0)
+    }
+  end
+
+  defp cancel_retry(%State{} = state, issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: timer_ref} when is_reference(timer_ref) ->
+        Process.cancel_timer(timer_ref)
+        %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+
+      _ ->
+        %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+    end
+  end
+
+  defp put_stopped_issue(%State{} = state, issue_id, stopped_entry) when is_binary(issue_id) and is_map(stopped_entry) do
+    %{state | stopped: Map.put(state.stopped, issue_id, stopped_entry)}
+  end
+
+  defp fetch_issue_state_name(issue_id) when is_binary(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{state: state_name} | _]} when is_binary(state_name) -> state_name
+      _ -> nil
+    end
   end
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
